@@ -1,8 +1,6 @@
 package usageestimate
 
 import (
-	"strings"
-
 	"github.com/r9s-ai/open-next-router/onr-core/pkg/dslconfig"
 )
 
@@ -62,123 +60,79 @@ type tokenEstimateContext struct {
 
 func Estimate(cfg *Config, in Input) Output {
 	u, stage := normalizeUpstreamUsage(in.UpstreamUsage)
-	if cfg == nil || !cfg.IsAPIEnabled(in.API) {
+	// normalizeUpstreamUsage returns one of three states:
+	// 1. u == nil, stage == "": no upstream usage object.
+	// 2. u != nil, stage == StageUpstream: upstream usage has at least one non-zero signal.
+	// 3. u != nil, stage == "": upstream usage exists but is effectively all-zero.
+	if cfg == nil || !cfg.IsAPIEnabled(in.API) || !cfg.EstimateWhenMissingOrZero {
 
 		return Output{Usage: u, Stage: stage}
 	}
 
+	// State 2 with both scalar token fields present: return upstream usage as-is.
+	if u != nil && u.InputTokens > 0 && u.OutputTokens > 0 {
+		return Output{Usage: u, Stage: stage}
+	}
+
+	var outUsage *dslconfig.Usage
+	var estimatePromptSuccessed, estimateCompletionsSuccessed bool
+	var outStage string
+
 	if u != nil {
-		if !cfg.EstimateWhenMissingOrZero {
-			return Output{Usage: u, Stage: stage}
-		}
-		// Upstream usage exists; optionally estimate missing fields (common in streaming).
-		if stage == StageUpstream {
-			if outU, outStage := estimateMissingFields(cfg, in, u); outStage != StageUpstream {
-				return Output{Usage: outU, Stage: outStage}
-			}
-			return Output{Usage: u, Stage: stage}
-		}
-		// All-zero (or effectively missing) usage: allow estimation.
-		if !isAllZero(u) {
-			return Output{Usage: u, Stage: stage}
-		}
-	}
-	if u == nil && !cfg.EstimateWhenMissingOrZero {
-		return Output{Usage: nil, Stage: ""}
-	}
-
-	reqParsed := parseRequestBody(in.RequestBody, in.RequestRoot, cfg.MaxRequestBytes)
-	reqCtx := extractRequestTextFromParsed(in.API, reqParsed)
-	respText := ""
-	if len(in.StreamTail) > 0 {
-		respText = extractStreamText(in.API, in.StreamTail, cfg.MaxStreamCollectBytes)
+		copied := *u
+		outUsage = &copied
 	} else {
-		respText = extractResponseTextForModel(in.API, in.Model, in.ResponseBody, cfg.MaxResponseBytes)
+		outUsage = &dslconfig.Usage{}
 	}
 
-	respCtx := &tokenEstimateContext{text: respText, completion: true, numTools: 0}
-	est := &dslconfig.Usage{
-		InputTokens:  EstimateTokenByModel(in.Model, reqCtx),
-		OutputTokens: EstimateTokenByModel(in.Model, respCtx),
-	}
-	est.TotalTokens = est.InputTokens + est.OutputTokens
+	// States 1 and 3 estimate from an empty/all-zero base. State 2 reaches here
+	// only when one scalar token field is missing; keep existing upstream fields
+	// and estimate only the missing side.
+	if outUsage == nil || outUsage.InputTokens == 0 {
 
-	// Best-effort overhead for OpenAI-style chat messages.
-	if normalizeAPI(in.API) == apiChatCompletions {
-		msgCount := countMessagesFromParsed(reqParsed)
-		if msgCount > 0 {
-			est.InputTokens += msgCount*3 + 3
-			est.TotalTokens = est.InputTokens + est.OutputTokens
+		reqParsed := parseRequestBody(in.RequestBody, in.RequestRoot, cfg.MaxRequestBytes)
+		reqCtx := extractRequestTextFromParsed(in.API, reqParsed)
+		inputTokens := EstimateTokenByModel(in.Model, reqCtx)
+		if inputTokens > 0 {
+			estimatePromptSuccessed = true
 		}
+		outUsage.InputTokens = inputTokens
+
 	}
 
-	return Output{Usage: est, Stage: StageEstimateBoth}
-}
+	if outUsage == nil || outUsage.OutputTokens == 0 {
+		respText := ""
 
-func estimateMissingFields(cfg *Config, in Input, u *dslconfig.Usage) (*dslconfig.Usage, string) {
-	if cfg == nil || u == nil {
-		return u, StageUpstream
-	}
-	needPrompt := u.InputTokens == 0
-	needCompletion := u.OutputTokens == 0
-	if !needPrompt && !needCompletion {
-		return u, StageUpstream
-	}
-
-	reqParsed := parseRequestBody(in.RequestBody, in.RequestRoot, cfg.MaxRequestBytes)
-	reqCtx := &tokenEstimateContext{}
-	if needPrompt {
-		reqCtx = extractRequestTextFromParsed(in.API, reqParsed)
-		if strings.TrimSpace(reqCtx.text) == "" {
-			needPrompt = false
-		}
-	}
-
-	var respText string
-	if needCompletion {
 		if len(in.StreamTail) > 0 {
 			respText = extractStreamText(in.API, in.StreamTail, cfg.MaxStreamCollectBytes)
 		} else {
 			respText = extractResponseTextForModel(in.API, in.Model, in.ResponseBody, cfg.MaxResponseBytes)
 		}
-		if strings.TrimSpace(respText) == "" {
-			needCompletion = false
+
+		respCtx := &tokenEstimateContext{text: respText, completion: true, numTools: 0}
+		outputTokens := EstimateTokenByModel(in.Model, respCtx)
+		if outputTokens > 0 {
+			estimateCompletionsSuccessed = true
 		}
+		outUsage.OutputTokens = outputTokens
+	}
+	if !estimateCompletionsSuccessed && !estimatePromptSuccessed {
+		return Output{Usage: u, Stage: stage}
 	}
 
-	if !needPrompt && !needCompletion {
-		return u, StageUpstream
+	outUsage.TotalTokens = outUsage.InputTokens + outUsage.OutputTokens
+	if estimatePromptSuccessed {
+		outStage = StageEstimatePrompt
+	}
+	if estimateCompletionsSuccessed {
+		outStage = StageEstimateCompletion
+	}
+	if estimatePromptSuccessed && estimateCompletionsSuccessed {
+		outStage = StageEstimateBoth
 	}
 
-	out := *u
-	if needPrompt {
-		out.InputTokens = EstimateTokenByModel(in.Model, reqCtx)
-	}
-	if needCompletion {
-		respCtx := &tokenEstimateContext{text: respText, completion: true}
-		out.OutputTokens = EstimateTokenByModel(in.Model, respCtx)
-	}
-	out.TotalTokens = out.InputTokens + out.OutputTokens
+	return Output{Usage: outUsage, Stage: outStage}
 
-	// Best-effort overhead for OpenAI-style chat messages only when prompt is estimated.
-	if needPrompt && normalizeAPI(in.API) == apiChatCompletions {
-		msgCount := countMessagesFromParsed(reqParsed)
-		if msgCount > 0 {
-			out.InputTokens += msgCount*3 + 3
-			out.TotalTokens = out.InputTokens + out.OutputTokens
-		}
-	}
-
-	switch {
-	case needPrompt && needCompletion:
-		return &out, StageEstimateBoth
-	case needPrompt:
-		return &out, StageEstimatePrompt
-	case needCompletion:
-		return &out, StageEstimateCompletion
-	default:
-		return u, StageUpstream
-	}
 }
 
 func normalizeUpstreamUsage(u *dslconfig.Usage) (*dslconfig.Usage, string) {
